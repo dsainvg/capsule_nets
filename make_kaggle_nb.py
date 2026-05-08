@@ -196,14 +196,178 @@ def tf_dataset_to_jax(dataset):
         yield jnp.array(images.numpy()), jnp.array(labels.numpy())
 """
 
+train_setup_code = """
+# Kaggle Run Configuration
+DATASET = 'mnist'
+EPOCHS = 7
+LEARNING_RATE = 0.001
+SUBSET_SIZE = None  # None uses the full dataset
+
+# Multi-GPU Setup
+num_devices = jax.local_device_count()
+print(f"Number of JAX devices available: {num_devices}")
+
+# Global batch size must be divisible by the number of devices
+# We use 128 images per GPU
+BATCH_SIZE = 128 * num_devices
+
+# Scaled up model parameters
+CONV_FEATURES = 512       
+PRIMARY_CHANNELS = 512    
+PRIMARY_DIM = 16          
+DIGIT_DIM = 32            
+DECODER_HIDDEN1 = 1024    
+DECODER_HIDDEN2 = 2048    
+
+def shard_batch(batch):
+    images, labels = batch
+    # Reshape to (num_devices, batch_size_per_device, ...)
+    images = jnp.reshape(images, (num_devices, -1) + images.shape[1:])
+    labels = jnp.reshape(labels, (num_devices, -1) + labels.shape[1:])
+    return images, labels
+
+def create_train_state(rng, model, learning_rate, input_shape):
+    dummy_input = jnp.ones(input_shape)
+    dummy_labels = jnp.ones((input_shape[0], model.num_classes))
+    params = model.init(rng, dummy_input, dummy_labels)['params']
+    tx = optax.adam(learning_rate)
+    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+
+# jax.pmap applies the function across all available devices
+@functools.partial(jax.pmap, axis_name='batch')
+def p_train_step(state, images, labels, alpha=0.0005):
+    def loss_fn(params):
+        lengths, reconstructions = state.apply_fn({'params': params}, images, labels=labels)
+        m_loss = margin_loss(labels, lengths)
+        r_loss = reconstruction_loss(images, reconstructions)
+        total_loss = m_loss + alpha * r_loss
+        return total_loss, (m_loss, r_loss, lengths)
+    
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (total_loss, (m_loss, r_loss, lengths)), grads = grad_fn(state.params)
+    
+    # Average gradients across all devices before updating
+    grads = jax.lax.pmean(grads, axis_name='batch')
+    state = state.apply_gradients(grads=grads)
+    
+    predictions = jnp.argmax(lengths, axis=-1)
+    true_labels = jnp.argmax(labels, axis=-1)
+    accuracy = jnp.mean(predictions == true_labels)
+    
+    metrics = {'loss': total_loss, 'margin_loss': m_loss, 'accuracy': accuracy}
+    # Average metrics across all devices
+    metrics = jax.lax.pmean(metrics, axis_name='batch')
+    
+    return state, metrics
+
+@functools.partial(jax.pmap, axis_name='batch')
+def p_eval_step(state, images, labels, alpha=0.0005):
+    lengths, reconstructions = state.apply_fn({'params': state.params}, images, labels=None)
+    m_loss = margin_loss(labels, lengths)
+    r_loss = reconstruction_loss(images, reconstructions)
+    total_loss = m_loss + alpha * r_loss
+    
+    predictions = jnp.argmax(lengths, axis=-1)
+    true_labels = jnp.argmax(labels, axis=-1)
+    accuracy = jnp.mean(predictions == true_labels)
+    
+    metrics = {'loss': total_loss, 'margin_loss': m_loss, 'accuracy': accuracy}
+    metrics = jax.lax.pmean(metrics, axis_name='batch')
+    
+    return metrics, reconstructions
+"""
+
+loop_code = """
+print(f"Loading {DATASET} dataset (Subset size: {SUBSET_SIZE if SUBSET_SIZE else 'Full'})...")
+train_ds, test_ds, info = get_datasets(DATASET, BATCH_SIZE, subset_size=SUBSET_SIZE)
+
+# We use batch size of 1 for the dummy shape during model initialization on the host
+dummy_input_shape = (1,) + info.features['image'].shape
+
+model = CapsNet(
+    num_classes=10,
+    dataset_name=DATASET,
+    conv_features=CONV_FEATURES,
+    primary_channels=PRIMARY_CHANNELS,
+    primary_dim=PRIMARY_DIM,
+    digit_dim=DIGIT_DIM,
+    decoder_hidden1=DECODER_HIDDEN1,
+    decoder_hidden2=DECODER_HIDDEN2
+)
+
+rng = jax.random.PRNGKey(42)
+rng, init_rng = jax.random.split(rng)
+
+# Create state on host
+state = create_train_state(init_rng, model, LEARNING_RATE, dummy_input_shape)
+
+# Replicate the state to all devices
+state = jax_utils.replicate(state)
+
+for epoch in range(EPOCHS):
+    start_time = time.time()
+    
+    # Train
+    train_metrics = []
+    for batch in tqdm(tf_dataset_to_jax(train_ds), desc=f"Epoch {epoch+1} Train", leave=False):
+        images, labels = shard_batch(batch)
+        state, metrics = p_train_step(state, images, labels)
+        
+        # metrics are identical across devices because of pmean, so we just take the 0th device's copy
+        train_metrics.append({k: v[0] for k, v in metrics.items()})
+    
+    train_loss = jnp.mean(jnp.array([m['loss'] for m in train_metrics]))
+    train_acc = jnp.mean(jnp.array([m['accuracy'] for m in train_metrics]))
+    
+    # Evaluate
+    eval_metrics = []
+    last_images, last_recons = None, None
+    for batch in tqdm(tf_dataset_to_jax(test_ds), desc=f"Epoch {epoch+1} Eval", leave=False):
+        images, labels = shard_batch(batch)
+        metrics, reconstructions = p_eval_step(state, images, labels)
+        
+        eval_metrics.append({k: v[0] for k, v in metrics.items()})
+        
+        # Save one device's batch for plotting
+        last_images, last_recons = images[0], reconstructions[0]
+        
+    eval_loss = jnp.mean(jnp.array([m['loss'] for m in eval_metrics]))
+    eval_acc = jnp.mean(jnp.array([m['accuracy'] for m in eval_metrics]))
+    
+    print(f"Epoch {epoch+1} in {time.time() - start_time:.2f}s")
+    print(f"  Train Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}")
+    print(f"  Test Loss: {eval_loss:.4f}, Accuracy: {eval_acc:.4f}")
+"""
+
+plot_code = """
+if last_images is not None:
+    num_plot = min(10, last_images.shape[0])
+    plt.figure(figsize=(num_plot * 2, 4))
+    for i in range(num_plot):
+        # Original
+        plt.subplot(2, num_plot, i + 1)
+        plt.imshow(last_images[i].squeeze(), cmap='gray')
+        plt.title("Original")
+        plt.axis('off')
+        
+        # Reconstructed
+        plt.subplot(2, num_plot, num_plot + i + 1)
+        plt.imshow(last_recons[i].squeeze(), cmap='gray')
+        plt.title("Recon")
+        plt.axis('off')
+        
+    plt.tight_layout()
+    plt.show()
+"""
+
 notebook = {
  "cells": [
   {
    "cell_type": "markdown",
    "metadata": {},
    "source": [
-    "# CapsNet on Kaggle (Standalone Version)\n",
-    "This notebook trains a scaled-up version of CapsNet on a subset of MNIST. It contains all the necessary source code within the notebook itself, so you don't need to clone any external repositories."
+    "# CapsNet on Kaggle (Standalone & Multi-GPU Version)\n",
+    "This notebook trains a scaled-up version of CapsNet on the full MNIST dataset. It contains all the necessary source code within the notebook itself, so you don't need to clone any external repositories. It also automatically detects and utilizes multiple GPUs using JAX `pmap` and `replicate`."
    ]
   },
   {
@@ -214,9 +378,12 @@ notebook = {
    "source": [
     "import os\n",
     "import sys\n",
+    "import functools\n",
     "import jax\n",
+    "import jax.numpy as jnp\n",
     "import optax\n",
     "from flax.training import train_state\n",
+    "from flax import jax_utils\n",
     "import time\n",
     "from tqdm.auto import tqdm\n",
     "import matplotlib.pyplot as plt\n"
@@ -261,156 +428,38 @@ notebook = {
   {
    "cell_type": "markdown",
    "metadata": {},
-   "source": ["## 4. Kaggle Configuration & Training Loop"]
+   "source": ["## 4. Kaggle Configuration & Setup (Multi-GPU)"]
   },
   {
    "cell_type": "code",
    "execution_count": None,
    "metadata": {},
    "outputs": [],
-   "source": [
-    "# Kaggle Run Configuration\n",
-    "DATASET = 'mnist'\n",
-    "BATCH_SIZE = 128\n",
-    "EPOCHS = 5\n",
-    "LEARNING_RATE = 0.001\n",
-    "SUBSET_SIZE = 10000  # Reasonable amount of data for quick run\n",
-    "\n",
-    "# Scaled up model parameters\n",
-    "CONV_FEATURES = 512       # Increased from 256\n",
-    "PRIMARY_CHANNELS = 512    # Increased from 256\n",
-    "PRIMARY_DIM = 16          # Increased from 8\n",
-    "DIGIT_DIM = 32            # Increased from 16\n",
-    "DECODER_HIDDEN1 = 1024    # Increased from 512\n",
-    "DECODER_HIDDEN2 = 2048    # Increased from 1024\n"
-   ]
+   "source": [train_setup_code.strip() + "\n"]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": ["## 5. Training Loop"]
   },
   {
    "cell_type": "code",
    "execution_count": None,
    "metadata": {},
    "outputs": [],
-   "source": [
-    "def create_train_state(rng, model, learning_rate, input_shape):\n",
-    "    dummy_input = jnp.ones(input_shape)\n",
-    "    dummy_labels = jnp.ones((input_shape[0], model.num_classes))\n",
-    "    params = model.init(rng, dummy_input, dummy_labels)['params']\n",
-    "    tx = optax.adam(learning_rate)\n",
-    "    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)\n",
-    "\n",
-    "@jax.jit\n",
-    "def train_step(state, images, labels, alpha=0.0005):\n",
-    "    def loss_fn(params):\n",
-    "        lengths, reconstructions = state.apply_fn({'params': params}, images, labels=labels)\n",
-    "        m_loss = margin_loss(labels, lengths)\n",
-    "        r_loss = reconstruction_loss(images, reconstructions)\n",
-    "        total_loss = m_loss + alpha * r_loss\n",
-    "        return total_loss, (m_loss, r_loss, lengths)\n",
-    "    \n",
-    "    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)\n",
-    "    (total_loss, (m_loss, r_loss, lengths)), grads = grad_fn(state.params)\n",
-    "    state = state.apply_gradients(grads=grads)\n",
-    "    \n",
-    "    predictions = jnp.argmax(lengths, axis=-1)\n",
-    "    true_labels = jnp.argmax(labels, axis=-1)\n",
-    "    accuracy = jnp.mean(predictions == true_labels)\n",
-    "    \n",
-    "    metrics = {'loss': total_loss, 'margin_loss': m_loss, 'accuracy': accuracy}\n",
-    "    return state, metrics\n",
-    "\n",
-    "@jax.jit\n",
-    "def eval_step(state, images, labels, alpha=0.0005):\n",
-    "    lengths, reconstructions = state.apply_fn({'params': state.params}, images, labels=None)\n",
-    "    m_loss = margin_loss(labels, lengths)\n",
-    "    r_loss = reconstruction_loss(images, reconstructions)\n",
-    "    total_loss = m_loss + alpha * r_loss\n",
-    "    \n",
-    "    predictions = jnp.argmax(lengths, axis=-1)\n",
-    "    true_labels = jnp.argmax(labels, axis=-1)\n",
-    "    accuracy = jnp.mean(predictions == true_labels)\n",
-    "    \n",
-    "    metrics = {'loss': total_loss, 'margin_loss': m_loss, 'accuracy': accuracy}\n",
-    "    return metrics, reconstructions\n"
-   ]
+   "source": [loop_code.strip() + "\n"]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": ["## 6. Plot Reconstructions"]
   },
   {
    "cell_type": "code",
    "execution_count": None,
    "metadata": {},
    "outputs": [],
-   "source": [
-    "print(f\"Loading {DATASET} dataset (Subset size: {SUBSET_SIZE})...\")\n",
-    "train_ds, test_ds, info = get_datasets(DATASET, BATCH_SIZE, subset_size=SUBSET_SIZE)\n",
-    "input_shape = (BATCH_SIZE,) + info.features['image'].shape\n",
-    "\n",
-    "model = CapsNet(\n",
-    "    num_classes=10,\n",
-    "    dataset_name=DATASET,\n",
-    "    conv_features=CONV_FEATURES,\n",
-    "    primary_channels=PRIMARY_CHANNELS,\n",
-    "    primary_dim=PRIMARY_DIM,\n",
-    "    digit_dim=DIGIT_DIM,\n",
-    "    decoder_hidden1=DECODER_HIDDEN1,\n",
-    "    decoder_hidden2=DECODER_HIDDEN2\n",
-    ")\n",
-    "\n",
-    "rng = jax.random.PRNGKey(42)\n",
-    "rng, init_rng = jax.random.split(rng)\n",
-    "state = create_train_state(init_rng, model, LEARNING_RATE, input_shape)\n",
-    "\n",
-    "for epoch in range(EPOCHS):\n",
-    "    start_time = time.time()\n",
-    "    \n",
-    "    # Train\n",
-    "    train_metrics = []\n",
-    "    for images, labels in tqdm(tf_dataset_to_jax(train_ds), desc=f\"Epoch {epoch+1} Train\", leave=False):\n",
-    "        state, metrics = train_step(state, images, labels)\n",
-    "        train_metrics.append(metrics)\n",
-    "    \n",
-    "    train_loss = jnp.mean(jnp.array([m['loss'] for m in train_metrics]))\n",
-    "    train_acc = jnp.mean(jnp.array([m['accuracy'] for m in train_metrics]))\n",
-    "    \n",
-    "    # Evaluate\n",
-    "    eval_metrics = []\n",
-    "    last_images, last_recons = None, None\n",
-    "    for images, labels in tqdm(tf_dataset_to_jax(test_ds), desc=f\"Epoch {epoch+1} Eval\", leave=False):\n",
-    "        metrics, reconstructions = eval_step(state, images, labels)\n",
-    "        eval_metrics.append(metrics)\n",
-    "        last_images, last_recons = images, reconstructions\n",
-    "        \n",
-    "    eval_loss = jnp.mean(jnp.array([m['loss'] for m in eval_metrics]))\n",
-    "    eval_acc = jnp.mean(jnp.array([m['accuracy'] for m in eval_metrics]))\n",
-    "    \n",
-    "    print(f\"Epoch {epoch+1} in {time.time() - start_time:.2f}s\")\n",
-    "    print(f\"  Train Loss: {train_loss:.4f}, Accuracy: {train_acc:.4f}\")\n",
-    "    print(f\"  Test Loss: {eval_loss:.4f}, Accuracy: {eval_acc:.4f}\")\n"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": None,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "if last_images is not None:\n",
-    "    num_plot = min(10, last_images.shape[0])\n",
-    "    plt.figure(figsize=(num_plot * 2, 4))\n",
-    "    for i in range(num_plot):\n",
-    "        # Original\n",
-    "        plt.subplot(2, num_plot, i + 1)\n",
-    "        plt.imshow(last_images[i].squeeze(), cmap='gray')\n",
-    "        plt.title(\"Original\")\n",
-    "        plt.axis('off')\n",
-    "        \n",
-    "        # Reconstructed\n",
-    "        plt.subplot(2, num_plot, num_plot + i + 1)\n",
-    "        plt.imshow(last_recons[i].squeeze(), cmap='gray')\n",
-    "        plt.title(\"Recon\")\n",
-    "        plt.axis('off')\n",
-    "        \n",
-    "    plt.tight_layout()\n",
-    "    plt.show()\n"
-   ]
+   "source": [plot_code.strip() + "\n"]
   }
  ],
  "metadata": {
