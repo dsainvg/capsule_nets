@@ -13,9 +13,9 @@ $env:PYTHONPATH = "."
 $py = ".\venv\Scripts\python.exe"
 
 Write-Host "--- Starting MNIST Training (1 Epoch) ---" -ForegroundColor Cyan
-& $py -m src.train --dataset mnist --epochs 1 --batch_size 128 --out_dir out
+& $py -m src.train --dataset mnist --epochs 1 --batch_size 128 --train_size 128 --test_size 128 --out_dir out
 
-Write-Host "`n--- Starting CIFAR-10 Training (1 Epoch) ---" -ForegroundColor Cyan
-& $py -m src.train --dataset cifar10 --epochs 1 --batch_size 64 --out_dir out
+# Write-Host "`n--- Starting CIFAR-10 Training (1 Epoch) ---" -ForegroundColor Cyan
+# & $py -m src.train --dataset cifar10 --epochs 1 --batch_size 64 --train_size 64 --test_size 64 --out_dir out
 
 Write-Host "`nDone! Check the 'out/' directory for reconstruction plots." -ForegroundColor Green

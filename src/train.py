@@ -118,7 +118,14 @@ def main(args):
 
     # Load data
     print(f"Loading {args.dataset} dataset...")
-    train_ds, test_ds, info = get_datasets(args.dataset, args.batch_size)
+    train_ds, test_ds, info = get_datasets(
+        args.dataset,
+        args.batch_size,
+        train_size=args.train_size,
+        test_size=args.test_size,
+    )
+    if args.train_size or args.test_size:
+        print(f"Using dataset subset: train_size={args.train_size}, test_size={args.test_size}")
     
     # Get shape from dataset info
     sample_shape = info.features['image'].shape
@@ -178,6 +185,8 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate', type=float, default=0.001)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--out_dir', type=str, default='out')
+    parser.add_argument('--train_size', type=int, default=None)
+    parser.add_argument('--test_size', type=int, default=None)
     args = parser.parse_args()
     
     # Run from root dir so modules import correctly

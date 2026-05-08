@@ -13,13 +13,14 @@ class DummyLabelFeature:
     def __init__(self, num_classes):
         self.num_classes = num_classes
 
-def get_datasets(dataset_name="mnist", batch_size=128):
+def get_datasets(dataset_name="mnist", batch_size=128, subset_size=None):
     """
     Loads and preprocesses the specified dataset using tf.keras.datasets.
     
     Args:
         dataset_name: "mnist" or "cifar10"
         batch_size: Batch size for training and evaluation.
+        subset_size: Optional integer to limit the dataset size for quicker training (e.g. Kaggle).
         
     Returns:
         train_ds: Training dataset (tf.data.Dataset)
@@ -52,6 +53,8 @@ def get_datasets(dataset_name="mnist", batch_size=128):
         
     # Prepare training dataset
     train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    if subset_size:
+        train_ds = train_ds.take(subset_size)
     train_ds = train_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
     train_ds = train_ds.cache()
     train_ds = train_ds.shuffle(buffer_size=10000)
@@ -60,6 +63,8 @@ def get_datasets(dataset_name="mnist", batch_size=128):
     
     # Prepare test dataset
     test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+    if subset_size:
+        test_ds = test_ds.take(max(100, subset_size // 5)) # Proportional subset
     test_ds = test_ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
     test_ds = test_ds.batch(batch_size, drop_remainder=True)
     test_ds = test_ds.cache()
