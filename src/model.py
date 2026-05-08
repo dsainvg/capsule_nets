@@ -90,9 +90,9 @@ class Decoder(nn.Module):
         import math
         # x is the active digit capsule or all digit capsules masked
         # Shape: [batch_size, num_capsules * capsule_dim]
-        x = nn.Dense(features=512)(x)
-        x = nn.relu(x)
         x = nn.Dense(features=1024)(x)
+        x = nn.relu(x)
+        x = nn.Dense(features=2048)(x)
         x = nn.relu(x)
         
         flat_output_size = math.prod(self.output_shape)
@@ -122,14 +122,14 @@ class CapsNet(nn.Module):
             conv1_stride = (1, 1)
             
         # 1. Conv1
-        x = nn.Conv(features=256, kernel_size=(9, 9), strides=conv1_stride, padding='VALID', name='conv1')(x)
+        x = nn.Conv(features=512, kernel_size=(9, 9), strides=conv1_stride, padding='VALID', name='conv1')(x)
         x = nn.relu(x)
         
         # 2. PrimaryCaps
-        x = PrimaryCaps(channels=256, capsule_dim=8, kernel_size=(9, 9), strides=(2, 2), name='primary_caps')(x)
+        x = PrimaryCaps(channels=512, capsule_dim=16, kernel_size=(9, 9), strides=(2, 2), name='primary_caps')(x)
         
         # 3. DigitCaps
-        capsules = DigitCaps(num_capsules=self.num_classes, capsule_dim=16, routings=3, name='digit_caps')(x)
+        capsules = DigitCaps(num_capsules=self.num_classes, capsule_dim=32, routings=3, name='digit_caps')(x)
         
         # Calculate lengths of capsules for classification prediction
         # capsules shape: [batch_size, num_classes, 16]
